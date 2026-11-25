@@ -856,21 +856,39 @@ fn a_branch_that_writes_lds_two_different_values_keeps_64_lanes() {
 
 #[test]
 fn masked_backward_permute_honours_inactive_sources_and_destinations() {
+    check_masked_backward_permute(&[]);
+}
+
+#[test]
+fn masked_backward_permute_after_copying_exec_as_two_dwords() {
+    check_masked_backward_permute(&[
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0xBEFE_0412, // restore full EXEC
+        0xBE96_0314, // s_mov_b32 s22, s20
+        0xBE97_0315, // s_mov_b32 s23, s21
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+    ]);
+}
+
+fn check_masked_backward_permute(mask_copy: &[u32]) {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
     };
 
-    let body = [
+    let mut body = vec![
         0x4A04_00A1, // v_add_nc_u32 v2, 33, v0
         0x3404_0482, // v_lshlrev_b32 v2, 2, v2
         0x7E02_02AA, // v_mov_b32 v1, 42 (inactive destination sentinel)
         0xBE92_047E, // s_mov_b64 s[18:19], exec
         0x7DA8_00AF, // v_cmpx_gt_u32 exec, 47, v0
-        0xDACC_0000, 0x0100_0002,
+    ];
+    body.extend_from_slice(mask_copy);
+    body.extend_from_slice(&[
+        0xDACC_0000, 0x0100_0002, // ds_bpermute_b32 v1, v2, v0
         0xBEFE_0412, // restore exec
         0x3406_0082, // v_lshlrev_b32 v3, 2, v0
         0xE070_1000, 0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
-    ];
+    ]);
     let mut shaders = Vec::new();
     for threads in [16, 33, 47, 64] {
         let native = native_of(&body, true, threads);

@@ -813,6 +813,11 @@ void look() {
         /// `VICTORY_TILES_TEST_CARD=1`; `None` without one, without tiled
         /// resources of tier 2, or on the card without the debug layer.
         fn new() -> Option<Rig> {
+            Self::new_for_texture_test(true)
+        }
+
+        // Only the reserved-resource fixture needs the tiled-resource checks.
+        fn new_for_texture_test(tiled: bool) -> Option<Rig> {
             // SAFETY: plain object creation on a device of our own.
             unsafe {
                 let card = std::env::var_os("VICTORY_TILES_TEST_CARD").is_some_and(|v| v == "1");
@@ -822,7 +827,7 @@ void look() {
                 let mut layer: Option<ID3D12Debug> = None;
                 let layered = D3D12GetDebugInterface(&mut layer).is_ok() && layer.is_some();
                 layer.iter().for_each(|l| l.EnableDebugLayer());
-                if card && !layered {
+                if tiled && card && !layered {
                     eprintln!("no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it");
                     return None;
                 }
@@ -849,7 +854,7 @@ void look() {
                     options.TiledResourcesTier.0,
                     if messages.is_some() { "on" } else { "not installed" }
                 );
-                if options.TiledResourcesTier.0 < 2 {
+                if tiled && options.TiledResourcesTier.0 < 2 {
                     return None;
                 }
                 let queue: ID3D12CommandQueue = device
@@ -1391,6 +1396,185 @@ void look() {
         assert_eq!(read[0], 32, "the resident view clamps sampling to level 1");
         assert_eq!(read[1], 0, "the legacy view samples the unmapped level 2");
         Some(())
+    }
+
+    const CLAMP_LOOK: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors = 4)), UAV(u0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)"
+Texture2D<float4> clamped : register(t0);
+Texture2D<float4> whole : register(t1);
+Texture2D<float4> clamped_with_min_lod : register(t2);
+Texture2D<float4> whole_with_min_lod : register(t3);
+SamplerState nearest : register(s0);
+RWByteAddressBuffer words : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void look() {
+    float4 a = clamped.SampleLevel(nearest, float2(0.3, 0.3), 0);
+    float4 b = whole.SampleLevel(nearest, float2(0.3, 0.3), 0);
+    float4 c = clamped_with_min_lod.SampleLevel(nearest, float2(0.3, 0.3), 0);
+    float4 d = whole_with_min_lod.SampleLevel(nearest, float2(0.3, 0.3), 0);
+    words.Store(0, (uint)(a.x * 255.0 + 0.5));
+    words.Store(4, (uint)(b.x * 255.0 + 0.5));
+    words.Store(8, (uint)(c.x * 255.0 + 0.5));
+    words.Store(12, (uint)(d.x * 255.0 + 0.5));
+}
+"#;
+
+    fn sample_committed_mip_clamp(rig: &mut Rig) -> Option<()> {
+        rig.step = "sample a committed texture";
+        let cs = compile(CLAMP_LOOK, s!("look"), s!("cs_5_1")).ok()?;
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let levels = 4;
+        let resident = 0b1110;
+        let desc = Rig::desc(format, 8, levels, false);
+        let layout = rig.footprints(&desc);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut texture = None;
+        // SAFETY: a fully backed test texture with four initialized mips.
+        unsafe {
+            rig.device.CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                None, &mut texture,
+            ).unwrap();
+        }
+        let texture = texture.unwrap();
+        let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
+        rig.round_trip(&texture, &layout, Some(&upload));
+        // SAFETY: plain object creation; the views are made in a heap
+        // that lives to the end of the function, of a live texture.
+        let (root, pipeline, views, words, back) = unsafe {
+            let root: ID3D12RootSignature = rig.device.CreateRootSignature(0, &cs[..]).ok()?;
+            let pipeline: ID3D12PipelineState = rig
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.as_ptr().cast(),
+                        BytecodeLength: cs.len(),
+                    },
+                    ..Default::default()
+                })
+                .ok()?;
+            let views: ID3D12DescriptorHeap = rig
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 4,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            let as_asked = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: 5768,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: u32::MAX,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            let mut shown = as_asked;
+            show_resident(&mut shown, resident, u32::from(levels));
+            assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
+            assert_eq!(shown.Anonymous.Texture2D.MipLevels, 3);
+            let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let mut at = views.GetCPUDescriptorHandleForHeapStart();
+            rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
+            at.ptr += step;
+            rig.device.CreateShaderResourceView(&texture, Some(&raw const as_asked), at);
+            let mut with_min_lod = as_asked;
+            with_min_lod.Anonymous.Texture2D.ResourceMinLODClamp = 3.0;
+            let mut shown_with_min_lod = with_min_lod;
+            show_resident(&mut shown_with_min_lod, resident, u32::from(levels));
+            let selected = shown_with_min_lod.Anonymous.Texture2D;
+            eprintln!(
+                "resident SRV: first mip {}, count {}, minimum LOD {}",
+                selected.MostDetailedMip, selected.MipLevels, selected.ResourceMinLODClamp
+            );
+            at.ptr += step;
+            rig.device.CreateShaderResourceView(&texture, Some(&raw const shown_with_min_lod), at);
+            at.ptr += step;
+            rig.device.CreateShaderResourceView(&texture, Some(&raw const with_min_lod), at);
+            let words = rig.buffer(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                256,
+            );
+            let back = rig.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, 256);
+            (root, pipeline, views, words, back)
+        };
+        // Before the one dispatch: the pipeline and all views are sound.
+        rig.check("the pipeline and the views made");
+        let mut timestamps: Option<ID3D12QueryHeap> = None;
+        unsafe {
+            rig.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0,
+                },
+                &mut timestamps,
+            ).unwrap();
+        }
+        let timestamps = timestamps.unwrap();
+        rig.run(|list| {
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pipeline);
+                list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRootUnorderedAccessView(1, words.GetGPUVirtualAddress());
+                list.EndQuery(&timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                list.Dispatch(1, 1, 1);
+                list.EndQuery(&timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(&timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 16);
+                list.ResourceBarrier(&[transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyBufferRegion(&back, 0, &words, 0, 16);
+            }
+        });
+        // SAFETY: a read-back buffer the finished list copied sixteen bytes into.
+        let (read, ticks) = unsafe {
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: 32 };
+            back.Map(0, Some(&range), Some(&mut data)).unwrap();
+            let read = std::slice::from_raw_parts(data.cast::<u32>(), 4).to_vec();
+            let ticks = std::slice::from_raw_parts(data.cast::<u64>().add(2), 2);
+            let elapsed = ticks[1].checked_sub(ticks[0]).unwrap();
+            back.Unmap(0, None);
+            (read, elapsed)
+        };
+        assert_eq!(read[0], 32, "zero clamp keeps the selected first mip");
+        let frequency = unsafe { rig.queue.GetTimestampFrequency().unwrap() };
+        let ns = ticks as f64 * 1e9 / frequency as f64;
+        eprintln!("D3D12 probe output {read:?}, one sampled dispatch {ns:.1} ns");
+        assert_eq!(read[1], 16);
+        assert_eq!(read[3], 64, "resource LOD clamp 3.0 reads level 3");
+        assert_eq!(read[2], read[3], "shifting the resident view preserves the resource LOD clamp");
+        Some(())
+    }
+
+    #[test]
+    #[ignore = "standalone D3D12 adapter probe"]
+    fn committed_texture_keeps_original_resource_lod_clamp() {
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut rig = Rig::new_for_texture_test(false).expect("available D3D12 device");
+        // SAFETY: resolve the LUID returned by this test's live device.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(rig.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        let end = adapter.Description.iter().position(|&x| x == 0).unwrap_or(adapter.Description.len());
+        eprintln!("Adapter: {}", String::from_utf16_lossy(&adapter.Description[..end]));
+        assert!(sample_committed_mip_clamp(&mut rig).is_some(), "sample and readback executed");
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {

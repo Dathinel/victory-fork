@@ -943,3 +943,155 @@ fn check_masked_backward_permute(mask_copy: &[u32]) {
         eprintln!("wave{wave}, {threads} threads: verified every lane on the GPU");
     }
 }
+
+#[test]
+#[ignore = "hardware Wave32 probe; run separately for each pair of LDS switches"]
+fn combined_lds_rules_rtx_readback() {
+    let host = Host::new(false).expect("hardware");
+    let flags = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    for case in [
+        "flag",
+        "disjoint_add",
+        "overlapping_add",
+        "conflicting_value",
+        "particles_first_counter",
+        "particles_second_counter",
+        "particles_overlap",
+        "particles_masked_address",
+        "particles_masked_address_split_block",
+    ] {
+        let second = (case == "conflicting_value").then_some(2);
+        let mut native = flag_program(second);
+        if case.starts_with("particles_") {
+            let output_offset = if case == "particles_first_counter" { 16 } else { 20 };
+            let input_offset = if case == "particles_overlap" { 20 } else { 0 };
+            native = particle_counter_program(input_offset, output_offset, case.starts_with("particles_masked_address"), case.ends_with("_split_block"));
+        }
+        if case.ends_with("_add") {
+            let mut words: Vec<u32> = native
+                .code
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            let write = ds(DS_WRITE_B32, 0, 9, 2);
+            let i = words.windows(2).position(|w| w == write).unwrap();
+            words[i..i + 2].copy_from_slice(&ds(0, 0, 9, 2)); // ds_add_u32
+            if case == "disjoint_add" {
+                let read = ds(DS_READ_B32, 3, 9, 0);
+                let i = words.windows(2).position(|w| w == read).unwrap();
+                words[i] |= 4; // read the adjacent dword
+                let zero = ds(DS_WRITE_B32, 0, 9, 9);
+                let i = words.windows(2).position(|w| w == zero).unwrap() + 2;
+                words.splice(i..i, [zero[0] | 4, zero[1]]);
+            }
+            native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        }
+        let want32 = match case {
+            "flag" => flags,
+            "disjoint_add" | "particles_first_counter" | "particles_second_counter" => exact,
+            _ => false,
+        };
+        assert_eq!(
+            flag_wave(&native),
+            Some(if want32 { 32 } else { 64 }),
+            "{case}: flags={flags} exact={exact}"
+        );
+        if !want32 {
+            continue;
+        }
+        let last = native.code.len() - 12;
+        let tail: Vec<u8> = [0xE070_0000u32, 0x8002_0500, S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(native.code[last..], tail);
+        native.code.truncate(last);
+        for word in [
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0 (one dword per thread)
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5 (zero now means unwritten)
+            0xE070_1000,
+            0x8002_0503,
+            S_ENDPGM,
+        ] {
+            native.code.extend(word.to_le_bytes());
+        }
+        let p = crate::spill::build(&native).unwrap();
+        let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+        let (root, pso) = host.compute_pipeline(&shader).expect("hardware pipeline");
+        for below in [0u32, 1, 16, 31, 32, 33, 48, 63, 64] {
+            for skip in [0, 1] {
+                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                        ud[u.index as usize] = [below, skip][d as usize];
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("readback");
+                assert_eq!(
+                    out[0],
+                    vec![
+                        1 + match case {
+                            "disjoint_add" | "particles_first_counter" => below,
+                            "particles_second_counter" => if skip == 0 { 3 * below } else { 0 },
+                            _ => u32::from(below > 0),
+                        };
+                        64
+                    ],
+                    "{case}: below={below} skip={skip}"
+                );
+            }
+        }
+    }
+}
+
+// Synthetic divergent counters. An overlapping read must preserve Wave64.
+fn particle_counter_program(input_offset: u32, output_offset: u32, masked_address: bool, split_block: bool) -> NativeProgram {
+    let at = |mut words: [u32; 2], offset| {
+        words[0] |= offset;
+        words
+    };
+    let mut body = vec![0x7E12_0280, 0x7E0E_0283]; // v9 = 0 (LDS base), v7 = 3
+    body.extend(ds(DS_WRITE_B32, 0, 9, 7));
+    for offset in [16, 20] {
+        body.extend(at(ds(DS_WRITE_B32, 0, 9, 9), offset));
+    }
+    // Only lanes below s1 change their address from the second counter to slot 0.
+    // The later region runs lanes below s0, which may include both addresses.
+    if masked_address {
+        body.extend(at(ds(DS_WRITE_B32, 0, 9, 7), 20)); // seed the aliased counter
+        body.extend([0x7E10_0294, 0x7D88_0001, 0xBE8C_246A]);
+        if split_block {
+            body.push(0xBF88_0001); // s_cbranch_execz past the masked v_mov
+        }
+        body.extend([0x7E10_0280, 0xBEFE_040C]);
+    }
+    let mut branch = vec![0x7E04_0281]; // v2 = 1
+    branch.extend(at(ds(0, 0, 9, 2), 16));
+    // Keep the read reachable with a mixed first mask in the alias control.
+    let skip_read = if masked_address { 0xBF07_0101 } else { 0xBF07_8001 };
+    branch.extend([skip_read, 0xBF85_0004]); // skip the read and dependent add
+    branch.extend(at(ds(DS_READ_B32, 3, if masked_address { 8 } else { 9 }, 0), input_offset));
+    branch.extend(at(ds(0, 0, 9, 3), 20));
+    body.extend([0x7D88_0000, 0xBE8C_246A, 0xBF88_0000 | branch.len() as u32]);
+    body.extend(branch);
+    body.push(0xBEFE_040C); // restore EXEC
+    body.extend(at(ds(DS_READ_B32, 5, 9, 0), output_offset));
+    body.extend([0xE070_0000, 0x8002_0500]); // same output contract as flag_program
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}

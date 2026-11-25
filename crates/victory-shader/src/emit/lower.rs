@@ -822,6 +822,154 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// An LDS access as [`lds_meetings`] orders it.
+#[derive(Clone, PartialEq, Debug)]
+enum LdsUse {
+    Read,
+    Write,
+    /// A non-returning integer add. Only the final modular sum is observable.
+    AddU32,
+}
+
+fn lds_use(name: &str) -> LdsUse {
+    if name.starts_with("ds_read") {
+        return LdsUse::Read;
+    }
+    if name == "ds_add_u32" {
+        return LdsUse::AddU32;
+    }
+    LdsUse::Write
+}
+
+/// Per value, the instruction that writes it (for [`lds_dwords`]).
+fn lds_value_defs<'a>(p: &'a crate::ir::Program, st: &Structured) -> HashMap<Value, &'a Inst> {
+    let mut defs = HashMap::new();
+    for (block, guards) in p.blocks.iter().zip(&st.guards) {
+        for (inst, guard) in block.insts.iter().zip(guards) {
+            for &(reg, v) in &inst.writes {
+                // Inactive lanes retain their previous address after a masked move.
+                if guard.is_some() && matches!(reg, Reg::V(_)) {
+                    continue;
+                }
+                defs.insert(v, inst);
+            }
+        }
+    }
+    defs
+}
+
+/// The value `v` holds in every lane when a plain move of a constant wrote it.
+fn lds_constant(defs: &HashMap<Value, &Inst>, v: Value) -> Option<u32> {
+    let inst = defs.get(&v)?;
+    if !matches!(inst.name(), "v_mov_b32" | "s_mov_b32") {
+        return None;
+    }
+    let src = match &inst.fields {
+        Fields::Valu(x) if x.dpp.is_none() && x.sdwa.is_none() => x.src.first().cloned()?,
+        Fields::Sop { src, .. } => src.first().cloned()?,
+        _ => return None,
+    };
+    match src {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// The dwords of LDS an access touches, when its address is a constant; `None` if not known.
+fn lds_dwords(defs: &HashMap<Value, &Inst>, inst: &Inst) -> Option<Vec<u32>> {
+    let Fields::Ds { addr, offset0, offset1, gds: false, .. } = &inst.fields else {
+        return None;
+    };
+    let base = match addr {
+        Some(Operand::Vector { reg, .. }) => lds_constant(defs, inst.read(Reg::V(*reg))?)?,
+        _ => return None,
+    };
+    let name = inst.name();
+    let width = match name.rsplit('_').next() {
+        Some("b64" | "u64" | "i64" | "f64") => 2,
+        Some("b96") => 3,
+        Some("b128") => 4,
+        _ => 1,
+    };
+    let at: Vec<u32> = if name.contains("read2") || name.contains("write2") || name.contains("wrxchg2") {
+        let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
+        vec![base + u32::from(*offset0) * scale, base + u32::from(*offset1) * scale]
+    } else {
+        vec![base + (u32::from(*offset0) | u32::from(*offset1) << 8)]
+    };
+    Some(at.into_iter().flat_map(|a| (a / 4)..(a + 4 * width).div_ceil(4)).collect())
+}
+
+/// Whether two accesses of one region (a read and a write, or writes of different kinds) may
+/// touch the same dword.
+fn lds_conflict(uses: &[(LdsUse, Option<Vec<u32>>)]) -> bool {
+    // Disjoint instructions do not imply disjoint lanes of one instruction.
+    // A plain store or a returning atomic needs its own proof (e.g. lds_flag_region).
+    if uses.iter().any(|(op, _)| *op == LdsUse::Write) {
+        return true;
+    }
+    for (i, (a, da)) in uses.iter().enumerate() {
+        for (b, db) in &uses[i + 1..] {
+            if a == b {
+                continue;
+            }
+            match (da, db) {
+                (Some(x), Some(y)) if !x.iter().any(|d| y.contains(d)) => {}
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod lds_exact_tests {
+    use super::{LdsUse, lds_conflict, lds_use};
+
+    #[test]
+    fn kinds() {
+        assert_eq!(lds_use("ds_read_b32"), LdsUse::Read);
+        assert_eq!(lds_use("ds_read2_b32"), LdsUse::Read);
+        assert_eq!(lds_use("ds_write_b32"), LdsUse::Write);
+        assert_eq!(lds_use("ds_add_rtn_u32"), LdsUse::Write);
+        assert_eq!(lds_use("ds_add_u32"), LdsUse::AddU32);
+        assert_ne!(lds_use("ds_add_u32"), lds_use("ds_max_u32"));
+        // not order-free: exchange, compare-store, wrapping increments
+        assert_eq!(lds_use("ds_wrxchg_rtn_b32"), LdsUse::Write);
+        assert_eq!(lds_use("ds_cmpst_b32"), LdsUse::Write);
+        assert_eq!(lds_use("ds_inc_u32"), LdsUse::Write);
+    }
+
+    #[test]
+    fn disjoint_read_does_not_establish_order_between_writing_lanes() {
+        for op in ["ds_add_rtn_u32", "ds_write_b32", "ds_min_f32"] {
+            let uses = [(LdsUse::Read, Some(vec![1])), (lds_use(op), Some(vec![0]))];
+            assert!(lds_conflict(&uses), "{op} needs a separate ordering proof");
+        }
+    }
+
+    #[test]
+    fn conflicts() {
+        let at = |d: &[u32]| Some(d.to_vec());
+        // 369cbe906ea72764: read slot 0, add to slots 4 and 5 (bytes 16, 20)
+        let add = || LdsUse::AddU32;
+        assert!(!lds_conflict(&[(LdsUse::Read, at(&[0])), (add(), at(&[4])), (add(), at(&[5]))]));
+        // a read of a dword the region also adds to
+        assert!(lds_conflict(&[(LdsUse::Read, at(&[4])), (add(), at(&[4]))]));
+        // a read and a write of the same dword
+        assert!(lds_conflict(&[(LdsUse::Read, at(&[2, 3])), (LdsUse::Write, at(&[3]))]));
+        // an address not known touches every dword
+        assert!(lds_conflict(&[(LdsUse::Read, None), (LdsUse::Write, at(&[9]))]));
+        assert!(lds_conflict(&[(LdsUse::Read, at(&[0])), (add(), None)]));
+        // atomics of one kind need no order; of two kinds on one dword they do
+        assert!(!lds_conflict(&[(add(), at(&[1])), (add(), at(&[1]))]));
+        assert!(lds_conflict(&[(add(), at(&[1])), (lds_use("ds_max_u32"), at(&[1]))]));
+        // reads alone never conflict
+        assert!(!lds_conflict(&[(LdsUse::Read, None), (LdsUse::Read, None)]));
+    }
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -862,9 +1010,11 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    // per region: LDS reads, LDS writes
+    // per region: LDS reads, LDS writes, and each access with the dwords it touches
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    let mut exact_regions = exact.then(|| (lds_value_defs(p, st), vec![Vec::new(); n]));
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
@@ -880,6 +1030,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             } else {
                 writes[r] = true;
             }
+            if let Some((defs, uses)) = &mut exact_regions {
+                uses[r].push((lds_use(name), lds_dwords(defs, i)));
+            }
         }
     }
     // A region that reads and writes LDS is still taken when it only raises flags
@@ -887,6 +1040,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // the region leaves behind.
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
+        if exact_regions.as_ref().is_some_and(|(_, uses)| !lds_conflict(&uses[r])) {
+            continue;
+        }
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
             return None;

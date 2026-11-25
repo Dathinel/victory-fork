@@ -677,6 +677,10 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if WIDE_HERE.get() && {
+            let size = cs.threads.iter().copied().map(u64::from).try_fold(1u64, u64::checked_mul);
+            size.is_some_and(|n| (128..=1024).contains(&n) && n.is_multiple_of(64))
+        } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

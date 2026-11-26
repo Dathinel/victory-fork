@@ -1407,6 +1407,7 @@ mod tests {
         };
         let cs = super::HostShader {
             stage: super::HwStage::Cs,
+            dispatch_contract: super::DispatchContract::None,
             dxil,
             user_data: l.user_data,
             samplers: Vec::new(),

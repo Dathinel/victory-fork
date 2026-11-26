@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DispatchContract, HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -155,7 +155,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -197,6 +197,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, match s.dispatch_contract { DispatchContract::None => 0, DispatchContract::Visibility => 1, DispatchContract::Prefilter => 2 });
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -270,6 +271,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let dispatch_contract = match r.word()? {
+        0 => DispatchContract::None,
+        1 if stage == HwStage::Cs => DispatchContract::Visibility,
+        2 if stage == HwStage::Cs => DispatchContract::Prefilter,
+        _ => return None,
+    };
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -316,6 +323,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     r.0.is_empty().then_some(HostShader {
         stage,
+        dispatch_contract,
         dxil,
         user_data,
         samplers,
@@ -331,9 +339,37 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_shader_preserves_dispatch_contract() {
+        let mut compute = shader();
+        compute.stage = HwStage::Cs;
+        for contract in [DispatchContract::None, DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert_eq!(decode(&encode(&compute)).unwrap().dispatch_contract, contract);
+        }
+        compute.stage = HwStage::Ps;
+        for contract in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert!(decode(&encode(&compute)).is_none());
+        }
+    }
+
+    #[test]
+    fn translator_fingerprint_includes_prefilter_setting() {
+        let mut expected = b"VICTORY_SPLIT_PREFILTER=".to_vec();
+        if let Some(value) = std::env::var_os("VICTORY_SPLIT_PREFILTER") {
+            expected.extend_from_slice(value.as_encoded_bytes());
+        }
+        expected.push(0);
+        let fingerprint = victory_shader::emit::translation_fingerprint();
+        assert!(fingerprint.windows(expected.len()).any(|part| part == expected));
+    }
+
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            dispatch_contract: DispatchContract::None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -367,26 +403,29 @@ mod tests {
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
         let container = b"a console container".as_slice();
+        let mut expected = shader();
+        expected.stage = HwStage::Cs;
+        expected.dispatch_contract = DispatchContract::Prefilter;
         let runs = AtomicU64::new(0);
         let translate = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
-            Ok(shader())
+            Ok(expected.clone())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok(expected.clone()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok(expected.clone()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(expected.clone()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok(expected.clone()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok(expected.clone()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.

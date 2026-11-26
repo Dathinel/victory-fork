@@ -661,7 +661,7 @@ pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident
     }
     let resident = resident & (u32::MAX >> (32 - levels));
     // The resource minimum LOD stays in resource mip coordinates.
-    let clamp = |most: &mut u32, mips: &mut u32| {
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: f32| {
         if *most >= levels || *mips == 0 || resident == 0 {
             return;
         }
@@ -674,10 +674,23 @@ pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident
             return;
         }
         let shift = coarser.trailing_zeros();
-        let first = *most + shift;
-        let available = (coarser >> shift).trailing_ones();
+        let mut first = *most + shift;
+        let minimum = min_lod as u32;
+        // If the first run ends below the resource minimum, prefer a
+        // resident run at or beyond that minimum within the requested view.
+        let first_end = first + (resident >> first).trailing_ones();
+        if minimum >= first_end && minimum < end {
+            let next = minimum + (resident >> minimum).trailing_zeros();
+            if next < end {
+                first = next;
+                while first > *most && resident & (1 << (first - 1)) != 0 {
+                    first -= 1;
+                }
+            }
+        }
+        let available = (resident >> first).trailing_ones();
         let count = if first < end { available.min(end - first) } else { 1 };
-        if shift == 0 && count == requested {
+        if first == *most && count == requested {
             return;
         }
         *most = first;
@@ -687,12 +700,12 @@ pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, view.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, view.ResourceMinLODClamp);
         }
         _ => {}
     }
@@ -1417,12 +1430,12 @@ void look() {
 }
 "#;
 
-    fn sample_committed_mip_clamp(rig: &mut Rig) -> Option<()> {
+    fn sample_committed_mip_clamp(rig: &mut Rig, resident: u32, minimum: f32) -> Option<()> {
         rig.step = "sample a committed texture";
         let cs = compile(CLAMP_LOOK, s!("look"), s!("cs_5_1")).ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let levels = 4;
-        let resident = 0b1110;
+
         let desc = Rig::desc(format, 8, levels, false);
         let layout = rig.footprints(&desc);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -1480,14 +1493,14 @@ void look() {
             let mut shown = as_asked;
             show_resident(&mut shown, resident, u32::from(levels));
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
-            assert_eq!(shown.Anonymous.Texture2D.MipLevels, 3);
+            assert_eq!(shown.Anonymous.Texture2D.MipLevels, (resident >> 1).trailing_ones());
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
             rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
             at.ptr += step;
             rig.device.CreateShaderResourceView(&texture, Some(&raw const as_asked), at);
             let mut with_min_lod = as_asked;
-            with_min_lod.Anonymous.Texture2D.ResourceMinLODClamp = 3.0;
+            with_min_lod.Anonymous.Texture2D.ResourceMinLODClamp = minimum;
             let mut shown_with_min_lod = with_min_lod;
             show_resident(&mut shown_with_min_lod, resident, u32::from(levels));
             let selected = shown_with_min_lod.Anonymous.Texture2D;
@@ -1553,7 +1566,7 @@ void look() {
         let ns = ticks as f64 * 1e9 / frequency as f64;
         eprintln!("D3D12 probe output {read:?}, one sampled dispatch {ns:.1} ns");
         assert_eq!(read[1], 16);
-        assert_eq!(read[3], 64, "resource LOD clamp 3.0 reads level 3");
+        assert_eq!(read[3], 64, "the reference view samples level 3");
         assert_eq!(read[2], read[3], "shifting the resident view preserves the resource LOD clamp");
         Some(())
     }
@@ -1571,7 +1584,10 @@ void look() {
         };
         let end = adapter.Description.iter().position(|&x| x == 0).unwrap_or(adapter.Description.len());
         eprintln!("Adapter: {}", String::from_utf16_lossy(&adapter.Description[..end]));
-        assert!(sample_committed_mip_clamp(&mut rig).is_some(), "sample and readback executed");
+        for (resident, minimum) in [(0b1110, 3.0), (0b1010, 3.0), (0b1010, 2.75)] {
+            eprintln!("resident mask {resident:#06b}, minimum {minimum}");
+            assert!(sample_committed_mip_clamp(&mut rig, resident, minimum).is_some(), "sample and readback executed");
+        }
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
@@ -1733,6 +1749,17 @@ void look() {
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
         assert_eq!(varr.ResourceMinLODClamp, 1.5);
+
+        for minimum in [2.75, 3.0] {
+            srv_arr.Anonymous.Texture2DArray.MostDetailedMip = 1;
+            srv_arr.Anonymous.Texture2DArray.MipLevels = 3;
+            srv_arr.Anonymous.Texture2DArray.ResourceMinLODClamp = minimum;
+            show_resident(&mut srv_arr, 0b1010, 4);
+            // SAFETY: the descriptor above selects a 2D array.
+            let selected = unsafe { srv_arr.Anonymous.Texture2DArray };
+            assert_eq!((selected.MostDetailedMip, selected.MipLevels), (3, 1));
+            assert_eq!(selected.ResourceMinLODClamp, minimum);
+        }
 
         // A view asking for a missing range still has a valid finer mip.
         show_resident(&mut srv_arr, 1, 11);

@@ -56,6 +56,17 @@ pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize)
     routines().retain(|&(id, ..)| id != registration);
 }
 
+/// `VICTORY_FULLSCREEN=1`: a top-level title window loses its frame and covers the
+/// primary display (the swap chain stretches the picture to it).
+fn full_screen(parent: HWND, style: u32, x: i32, y: i32, width: i32, height: i32) -> (u32, i32, i32, i32, i32) {
+    if !parent.is_null() || std::env::var_os("VICTORY_FULLSCREEN").is_none_or(|v| v != "1") {
+        return (style, x, y, width, height);
+    }
+    // SAFETY: two metrics of the primary display.
+    let (w, h) = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
+    (wm::WS_POPUP | wm::WS_VISIBLE, 0, 0, w, h)
+}
+
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
@@ -74,6 +85,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = full_screen(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -100,6 +112,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = full_screen(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(

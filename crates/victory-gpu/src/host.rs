@@ -9543,14 +9543,25 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             right: width as i32,
             bottom: height as i32,
         };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        // `VICTORY_FULLSCREEN=1`: a window without a frame over the whole primary display
+        // (the swap chain stretches the title's picture to it) instead of a framed one of
+        // the picture's size.
+        let full = std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1");
+        let (style, x, y) = if full {
+            rect.right = GetSystemMetrics(SM_CXSCREEN);
+            rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+            (WS_POPUP, 0, 0)
+        } else {
+            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+            (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT)
+        };
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            style | WS_VISIBLE,
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,

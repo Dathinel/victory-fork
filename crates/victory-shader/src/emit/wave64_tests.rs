@@ -1256,3 +1256,55 @@ fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
         eprintln!("ran on the hardware device (host_wave={host_wave}): partial dispatch limits 45, 1, 0 exact");
     }
 }
+
+
+#[test]
+#[ignore = "requires a wave32 hardware adapter"]
+fn multi_wave_stores_respect_exec_after_the_join() {
+    // v9 = lane byte offset. Mask to t > threshold, save EXEC, and skip the
+    // body when this guest wave is empty. The body restores the original EXEC.
+    let mut words = vec![
+        0x3412_0082, 0x7E0A_0281, 0x2C0C_0081, 0x340E_0B06,
+        0x7D82_0000, 0xBE87_0385, 0xBE8C_246A, 0xBF84_0019,
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0xBEFE_040C, 0x7E00_0207, 0x3800_0081, // restore EXEC and set v0 = s7 | 1
+        0xE070_1000, 0x8002_0009,              // store to output[t]
+        0x7E00_0287, 0xE070_1200, 0x8002_0009, // join: store 7 to output[128+t]
+    ]);
+    let native = native_of(&words, true, 128);
+    let program = crate::spill::build(&native).unwrap();
+    let st = structure::structure(&program).unwrap();
+    let res = resource::track(&program, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&program, &native).unwrap();
+    let mut header = [0u8; 32];
+    header[..4].copy_from_slice(b"DXBC");
+    header[20] = 1;
+    header[24] = 32;
+    let container = crate::dxbc::Container::parse(&header).unwrap();
+    let previous = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::with_wave_wide(true, || super::emit(&container, &native, &program, &st, &io, &res));
+    lower::TEST_HOST_WAVE.set(previous);
+    let shader = shader.expect("translate 128-thread fixture");
+    let host = Host::new(false).expect("requires a hardware adapter with wave32");
+    let (root, pso) = host.compute_pipeline(&shader).expect("create compute pipeline");
+    let mut errors = [0usize; 2];
+    for threshold in (0..=128u32).chain([200]) {
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![threshold, 0, 0, 0]))],
+            views: &[View::RawUav(256)], samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        for t in 0..128u32 {
+            let base = (t / 64) * 64;
+            let entered = base + 63 > threshold;
+            let mask = (base..base + 64).filter(|&i| i > threshold)
+                .fold(1u32, |bits, i| bits | (1 << ((i >> 1) & 31)));
+            let expected = [if entered { mask } else { 0 }, if entered { 7 } else { 0 }];
+            for (plane, want) in expected.into_iter().enumerate() {
+                errors[plane] += usize::from(out[0][plane * 128 + t as usize] != want);
+            }
+        }
+    }
+    assert_eq!(errors, [0, 0], "mismatches within branch and after join");
+}

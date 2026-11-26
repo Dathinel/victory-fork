@@ -211,6 +211,8 @@ struct Lower<'a> {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// Body-to-join edges mapped to the original branch and the guest wave's skip predicate.
+    wave_skip_edges: HashMap<(usize, usize), (usize, V)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -2022,6 +2024,7 @@ impl<'a> Lower<'a> {
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
+            wave_skip_edges: HashMap::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
@@ -4505,6 +4508,30 @@ impl<'a> Lower<'a> {
             let ptr = self.s.m.element(c, lds, idx);
             self.s.m.store(c, ptr, some);
             self.group_sync(c);
+            // All host waves take the same path to meet at barriers. Keep each guest
+            // wave's own decision for scalar values that survive a single-block body.
+            if let LaneExit::Branch { taken, not_taken, .. } = self.x.st.exits[b] {
+                for (body, join) in [(taken, not_taken), (not_taken, taken)] {
+                    if !matches!(self.x.st.exits[body], LaneExit::Jump(to) if to == join)
+                        || self.x.p.blocks[body].preds.as_slice() != [b]
+                        || self.x.p.blocks[join].preds.len() != 2
+                        || !(self.x.p.blocks[join].phis.iter().any(|p| matches!(p.reg, Reg::S(_) | Reg::Scc))
+                            || self.x.p.blocks[body].insts.iter().any(|i| i.name().starts_with("buffer_store_")))
+                    {
+                        continue;
+                    }
+                    let one = self.s.m.i32(1);
+                    let partner = self.s.m.bin(c, Bin::Xor, hw, one);
+                    let address = self.s.m.bin(c, Bin::Add, base, partner);
+                    let address = self.s.m.element(c, lds, address);
+                    let other = self.s.m.load(c, address);
+                    let either = self.s.m.bin(c, Bin::Or, some, other);
+                    let zero = self.s.m.i32(0);
+                    let comparison = if (join == taken) == any { pred::NE } else { pred::EQ };
+                    let skip = self.s.m.cmp(c, comparison, either, zero);
+                    self.wave_skip_edges.insert((body, join), (b, skip));
+                }
+            }
             let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
             let count = self.s.m.i32(host_waves);
             let z = self.s.m.i32(0);
@@ -11005,6 +11032,18 @@ impl<'a> Lower<'a> {
         let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
+        // A restored EXEC inside the body can reactivate lanes, but cannot make a
+        // guest wave execute a store whose branch it skipped altogether.
+        let guard = if store && let LaneExit::Jump(join) = self.x.st.exits[b]
+            && let Some(&(_, skip)) = self.wave_skip_edges.get(&(b, join))
+        {
+            let one = self.s.m.bool(true);
+            let enter = self.s.m.bin(c, Bin::Xor, skip, one);
+            Some(match guard {
+                Some(active) => self.s.m.bin(c, Bin::And, enter, active),
+                None => enter,
+            })
+        } else { guard };
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
@@ -11962,6 +12001,12 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                let x = if let Some(&(branch, skip)) = self.wave_skip_edges.get(&(q, b)) {
+                    let i = p.blocks[b].preds.iter().position(|&from| from == branch)
+                        .ok_or_else(|| unsupported(offset, "missing wave skip mask predecessor"))?;
+                    let before = self.boolean(args[i], qb).map_err(|w| unsupported(offset, w))?;
+                    self.s.m.select(qb, skip, before, x)
+                } else { x };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -12080,6 +12125,18 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                let x = if matches!(phi.reg, Reg::S(_) | Reg::Scc)
+                    && let Some(&(branch, skip)) = self.wave_skip_edges.get(&(q, b))
+                {
+                    let fallback = p.blocks[b].preds.iter().position(|&pred| pred == branch)
+                        .ok_or_else(|| unsupported(p.blocks[b].offset, "missing wave skip predecessor"))?;
+                    match (self.vals.get(&phi.args[fallback]).copied(), bit) {
+                        (Some(Val::I32(before)), false) | (Some(Val::Bit(before)), true) =>
+                            self.s.m.select(qb, skip, before, x),
+                        _ if !self.read_phis.contains(&phi.value) => x,
+                        _ => return Err(unsupported(p.blocks[b].offset, "unavailable scalar on wave skip edge")),
+                    }
+                } else { x };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

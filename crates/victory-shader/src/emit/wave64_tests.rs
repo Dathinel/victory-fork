@@ -853,3 +853,245 @@ fn a_branch_that_writes_lds_two_different_values_keeps_64_lanes() {
     // a second value after the read: what the flag ends up holding depends on what was read
     assert_eq!(flag_wave(&flag_program(Some(2))), Some(64));
 }
+
+#[test]
+fn masked_backward_permute_honours_inactive_sources_and_destinations() {
+    check_masked_backward_permute(&[]);
+}
+
+#[test]
+fn masked_backward_permute_after_copying_exec_as_two_dwords() {
+    check_masked_backward_permute(&[
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0xBEFE_0412, // restore full EXEC
+        0xBE96_0314, // s_mov_b32 s22, s20
+        0xBE97_0315, // s_mov_b32 s23, s21
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+    ]);
+}
+
+fn check_masked_backward_permute(mask_copy: &[u32]) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let mut body = vec![
+        0x4A04_00A1, // v_add_nc_u32 v2, 33, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7E02_02AA, // v_mov_b32 v1, 42 (inactive destination sentinel)
+        0xBE92_047E, // s_mov_b64 s[18:19], exec
+        0x7DA8_00AF, // v_cmpx_gt_u32 exec, 47, v0
+    ];
+    body.extend_from_slice(mask_copy);
+    body.extend_from_slice(&[
+        0xDACC_0000, 0x0100_0002, // ds_bpermute_b32 v1, v2, v0
+        0xBEFE_0412, // restore exec
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000, 0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+    ]);
+    let mut shaders = Vec::new();
+    for threads in [16, 33, 47, 64] {
+        let native = native_of(&body, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        for wave in [32, 64] {
+            let shader = lowered_on(&native, &p, &HashSet::new(), wave).expect("lower permute");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            shaders.push((threads, wave, shader));
+        }
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; dispatch skipped");
+        return;
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: caps is the out buffer for this feature query.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    }.expect("wave capabilities");
+    for (threads, wave, shader) in shaders {
+        if !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&wave) {
+            eprintln!("wave{wave} unavailable; dispatch skipped");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("permute compute pipeline");
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).expect("permute dispatch");
+        let expected = (0..threads)
+            .map(|lane| {
+                let source = (lane & !31) | ((lane + 1) & 31);
+                if lane >= 47 { 42 } else if source < threads.min(47) { source } else { 0 }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(out[0], expected, "wave{wave}, {threads} threads");
+        eprintln!("wave{wave}, {threads} threads: verified every lane on the GPU");
+    }
+}
+
+#[test]
+#[ignore = "hardware Wave32 probe; run separately for each pair of LDS switches"]
+fn combined_lds_rules_rtx_readback() {
+    let host = Host::new(false).expect("hardware");
+    let flags = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    for case in [
+        "flag",
+        "disjoint_add",
+        "overlapping_add",
+        "conflicting_value",
+        "particles_first_counter",
+        "particles_second_counter",
+        "particles_overlap",
+        "particles_masked_address",
+        "particles_masked_address_split_block",
+    ] {
+        let second = (case == "conflicting_value").then_some(2);
+        let mut native = flag_program(second);
+        if case.starts_with("particles_") {
+            let output_offset = if case == "particles_first_counter" { 16 } else { 20 };
+            let input_offset = if case == "particles_overlap" { 20 } else { 0 };
+            native = particle_counter_program(input_offset, output_offset, case.starts_with("particles_masked_address"), case.ends_with("_split_block"));
+        }
+        if case.ends_with("_add") {
+            let mut words: Vec<u32> = native
+                .code
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            let write = ds(DS_WRITE_B32, 0, 9, 2);
+            let i = words.windows(2).position(|w| w == write).unwrap();
+            words[i..i + 2].copy_from_slice(&ds(0, 0, 9, 2)); // ds_add_u32
+            if case == "disjoint_add" {
+                let read = ds(DS_READ_B32, 3, 9, 0);
+                let i = words.windows(2).position(|w| w == read).unwrap();
+                words[i] |= 4; // read the adjacent dword
+                let zero = ds(DS_WRITE_B32, 0, 9, 9);
+                let i = words.windows(2).position(|w| w == zero).unwrap() + 2;
+                words.splice(i..i, [zero[0] | 4, zero[1]]);
+            }
+            native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        }
+        let want32 = match case {
+            "flag" => flags,
+            "disjoint_add" | "particles_first_counter" | "particles_second_counter" => exact,
+            _ => false,
+        };
+        assert_eq!(
+            flag_wave(&native),
+            Some(if want32 { 32 } else { 64 }),
+            "{case}: flags={flags} exact={exact}"
+        );
+        if !want32 {
+            continue;
+        }
+        let last = native.code.len() - 12;
+        let tail: Vec<u8> = [0xE070_0000u32, 0x8002_0500, S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(native.code[last..], tail);
+        native.code.truncate(last);
+        for word in [
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0 (one dword per thread)
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5 (zero now means unwritten)
+            0xE070_1000,
+            0x8002_0503,
+            S_ENDPGM,
+        ] {
+            native.code.extend(word.to_le_bytes());
+        }
+        let p = crate::spill::build(&native).unwrap();
+        let shader = lowered(&native, &p, &HashSet::new()).unwrap();
+        let (root, pso) = host.compute_pipeline(&shader).expect("hardware pipeline");
+        for below in [0u32, 1, 16, 31, 32, 33, 48, 63, 64] {
+            for skip in [0, 1] {
+                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                        ud[u.index as usize] = [below, skip][d as usize];
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("readback");
+                assert_eq!(
+                    out[0],
+                    vec![
+                        1 + match case {
+                            "disjoint_add" | "particles_first_counter" => below,
+                            "particles_second_counter" => if skip == 0 { 3 * below } else { 0 },
+                            _ => u32::from(below > 0),
+                        };
+                        64
+                    ],
+                    "{case}: below={below} skip={skip}"
+                );
+            }
+        }
+    }
+}
+
+// Synthetic divergent counters. An overlapping read must preserve Wave64.
+fn particle_counter_program(input_offset: u32, output_offset: u32, masked_address: bool, split_block: bool) -> NativeProgram {
+    let at = |mut words: [u32; 2], offset| {
+        words[0] |= offset;
+        words
+    };
+    let mut body = vec![0x7E12_0280, 0x7E0E_0283]; // v9 = 0 (LDS base), v7 = 3
+    body.extend(ds(DS_WRITE_B32, 0, 9, 7));
+    for offset in [16, 20] {
+        body.extend(at(ds(DS_WRITE_B32, 0, 9, 9), offset));
+    }
+    // Only lanes below s1 change their address from the second counter to slot 0.
+    // The later region runs lanes below s0, which may include both addresses.
+    if masked_address {
+        body.extend(at(ds(DS_WRITE_B32, 0, 9, 7), 20)); // seed the aliased counter
+        body.extend([0x7E10_0294, 0x7D88_0001, 0xBE8C_246A]);
+        if split_block {
+            body.push(0xBF88_0001); // s_cbranch_execz past the masked v_mov
+        }
+        body.extend([0x7E10_0280, 0xBEFE_040C]);
+    }
+    let mut branch = vec![0x7E04_0281]; // v2 = 1
+    branch.extend(at(ds(0, 0, 9, 2), 16));
+    // Keep the read reachable with a mixed first mask in the alias control.
+    let skip_read = if masked_address { 0xBF07_0101 } else { 0xBF07_8001 };
+    branch.extend([skip_read, 0xBF85_0004]); // skip the read and dependent add
+    branch.extend(at(ds(DS_READ_B32, 3, if masked_address { 8 } else { 9 }, 0), input_offset));
+    branch.extend(at(ds(0, 0, 9, 3), 20));
+    body.extend([0x7D88_0000, 0xBE8C_246A, 0xBF88_0000 | branch.len() as u32]);
+    body.extend(branch);
+    body.push(0xBEFE_040C); // restore EXEC
+    body.extend(at(ds(DS_READ_B32, 5, 9, 0), output_offset));
+    body.extend([0xE070_0000, 0x8002_0500]); // same output contract as flag_program
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}

@@ -184,11 +184,8 @@ pub(crate) struct Spans {
 /// When a view the title writes makes an older view of other memory stale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
-    /// with another length, or within the older one's first [`HEAD`]
-    /// bytes (or the older within its own). No two textures share the
-    /// block of their smallest levels. A view that only reaches into the
-    /// address range of an older texture's larger levels says nothing.
+    /// Two views clash when the first bytes of their spans overlap, up to
+    /// [`HEAD`] bytes per texture. Larger levels may overlap a neighbour.
     #[default]
     Start,
     /// Whenever their spans at full size overlap (the rule until run
@@ -252,7 +249,8 @@ impl Spans {
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .range(start.saturating_sub(HEAD - 1)..end.min(start.saturating_add(HEAD)))
+                .filter(|(_, span)| span.0 > start)
                 .map(|(at, _)| *at)
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
@@ -3354,6 +3352,23 @@ mod tests {
         // A draw makes a slot of the second texture: it is one of them.
         assert!(spans.note(9, b, b + 0x2c000, false).is_empty());
         assert_eq!(spans.by_slot.get(&9), Some(&b));
+    }
+
+    #[test]
+    fn small_texture_heads_obey_their_byte_ranges_in_either_write_order() {
+        let base = 0x7_0000_0000u64;
+        for (offset, size, clash) in [(256, 256, false), (512, 8192, false), (255, 256, true)] {
+            for reverse in [false, true] {
+                let mut spans = Spans::default();
+                let small = (base, base + 256);
+                let other = (base + offset, base + offset + size);
+                let (first, second) = if reverse { (other, small) } else { (small, other) };
+                assert!(spans.note(1, first.0, first.1, true).is_empty());
+                let stale = spans.note(2, second.0, second.1, true);
+                assert_eq!(stale.as_slice(), if clash { &[1][..] } else { &[][..] },
+                    "offset={offset}, size={size}, reverse={reverse}");
+            }
+        }
     }
 
     /// A texture written where another starts replaces it: at the same

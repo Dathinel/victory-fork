@@ -53,6 +53,15 @@ contributors. Thank you.
     group's shared memory starts as the program's first store leaves it.
   - `water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly` takes the
     wave-wide form (it did not translate before).
+  - The water light's tile lists take a slot a lane
+    (`emit/water_tile_slots.rs`, `VICTORY_WATER_TILE_SLOTS=0`: as before).
+    Run as two host waves, the program that lists the water tiles to light
+    let the second wave's tiles overwrite slots of the first; those tiles got
+    no light and the sea had dark patches around boats, piers and lamp posts.
+    The idea is xss3009's "Fix transmission tile allocation on wave32 hosts"
+    (seen in the SmXme fork of VIctory-NVIDIA), written again for this tree.
+    With it the open water has its colour, its light and no dark patches on
+    a GeForce RTX 4070.
 - *Ray walkers* (`emit/lower.rs`, `emit/intersect.rs`): a load by address of a
   page that an earlier load of the same turn looked up goes through that
   look's view, and the second half of a 128-byte node through the first
@@ -90,8 +99,8 @@ scene at 1920x1080, in one play session: about 15 frames a second at 3,000 to
 limit: at 9,000 draws about 30 ms a frame go to five ray-walking programs and
 about 40 ms to ordinary drawing. The first visit to a place is slower while
 the driver builds that place's ray-tracing programs; they are saved for the
-next start. Known to be wrong still: foam on the water is drawn dark, and
-while travelling fast the ray programs' pages can lag behind.
+next start. Known to be wrong still: some vehicles' paint comes out a flat
+lime green, and while travelling fast the ray programs' pages can lag behind.
 
 **This fork's earlier work** (up to commit `9a9091d1`) stays in this
 repository's history, with its own credits in the README of that commit.

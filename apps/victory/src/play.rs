@@ -74,6 +74,8 @@ const SETTINGS: &[(&str, &str)] = &[
     // submission lock (host.rs `wait_for_slots`). With ray tracing on, at 9,000 to 12,000 draws a
     // frame, the submitting thread stood about 48 ms a frame at that lock; about 13 ms with it off.
     ("VICTORY_DYNAMIC_WAIT", "1"),
+    // The water's tiled light runs (it is left out on 32-lane hosts otherwise, make.rs).
+    ("VICTORY_WATER_LIGHT", "1"),
     // Light without the title's ray tracing
     ("VICTORY_AMBIENT", "0.8"),
     ("VICTORY_AMBIENT_AIR", "1.5"),

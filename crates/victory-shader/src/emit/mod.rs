@@ -274,6 +274,17 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
+/// Whether a load by address in a program that walks the title's structures
+/// takes the copy an earlier load of the same 64 KiB page found, without a
+/// look in the directory of its own (`lower.rs` `memory_near`;
+/// `VICTORY_MEMORY_NEAR=0`: every load looks). The same bytes are read
+/// either way: the switch is for measuring what the looks cost. Part of the
+/// translation: the shader cache keys on it.
+pub fn memory_near() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NEAR").is_none_or(|v| v != "0"))
+}
+
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
@@ -605,7 +616,7 @@ pub fn emit(
         };
         let forms = [
             ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
+            ("without skips", form("without skips", ir::without_skips(p, false, false))),
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
@@ -643,6 +654,9 @@ pub fn emit(
                     | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+                    // `CS_TransmissionVolumetrics_VolumePortalsOnly` (a10179ab7eda0dc3): the same
+                    // shape, 20 branches wave-wide. Not run on a card when this line was written.
+                    | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
@@ -665,7 +679,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true, false)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -677,13 +691,24 @@ pub fn emit(
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
                 if wide_on || driver_loop {
+                    // For the programs taken wave-wide: first with the skips around loops that
+                    // go round on a scalar test kept ([`ir::without_skips`], `loops_kept`),
+                    // which the wave then takes together; the form of before if that one
+                    // does not translate. (`VICTORY_WAVE_LOOP_SKIPS=0`: only the form of before.)
+                    let loops_on = std::env::var_os("VICTORY_WAVE_LOOP_SKIPS").is_none_or(|v| v != "0");
+                    let kept = if wide_on && deep_on && loops_on {
+                        form("without skips, loops kept", ir::without_skips(p, true, true))
+                    } else {
+                        None
+                    };
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    let before = bases.into_iter().flatten().next();
+                    for base in [kept.as_ref().map(|f| &f.0), before].into_iter().flatten() {
                         let again = widen(c, native, base, why, driver_loop, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {

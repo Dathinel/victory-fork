@@ -41,6 +41,32 @@ contributors. Thank you.
     back and wanted again.
   - A log line names the pipeline whenever a frame waited 50 ms or more for
     one.
+- *The water's light on 32-lane cards.* Three changes in the shader
+  translator (`crates/victory-shader/src/emit`), and the water's tiled volume
+  light is switched on (`VICTORY_WATER_LIGHT=1` in the launcher's settings):
+  - From VIctory-NVIDIA's newer commit `854f57f` (trustno1-coder; a port of
+    Vice-Tay `c125c0c`), with its test: console lanes in groups of several
+    host waves take their threads from a group counter. On NVIDIA cards some
+    threads of a group ran twice and others never, which left block-shaped
+    holes in the water's transmission pass.
+  - A skip around a loop on a scalar test is kept for the wave to take, and a
+    group's shared memory starts as the program's first store leaves it.
+  - `water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly` takes the
+    wave-wide form (it did not translate before).
+- *Ray walkers* (`emit/lower.rs`, `emit/intersect.rs`): a load by address of a
+  page that an earlier load of the same turn looked up goes through that
+  look's view, and the second half of a 128-byte node through the first
+  half's. A triangle step does one directory look instead of two, entering an
+  instance one instead of nine. `VICTORY_MEMORY_NEAR=0` gives the old code.
+- *Dynamic descriptor slots* (`crates/victory-gpu`): a list's translation
+  pauses while slots are short (`VICTORY_THIN_GATE`), so draws no longer go
+  without in busy scenes; one copy of a table for every length a list reads
+  it to; slots go back at the start of a landing; a counter line says how
+  many a frame takes and who holds them.
+- *Instruments* (diagnostics builds): the card's time of draws by what was
+  recorded with them and by whether they read a copy in the PC's memory, a
+  census of windows of title memory, and F9 to save one frame with every
+  texture its passes wrote.
 - *A stall at one lock* (`crates/victory-gpu/src/host.rs`, `wait_for_slots`).
   A draw that finds no free dynamic descriptor slot used to settle everything
   in flight while holding the submission lock; the submitting thread stood at
@@ -59,11 +85,13 @@ and the frame rate is higher. The `raytracing` branch is the same code as
 `main`.
 
 Ray tracing is work in progress. Measured on a GeForce RTX 4070 with the
-scene at 1920x1080: about 11 frames a second at 5,000 to 9,000 draws a frame
-and about 8 at 9,000 to 12,000, against about 18 to 14 and 12.5 without it.
-The first visit to a place is slower while the driver builds that place's
-ray-tracing programs; they are saved for the next start. Known to be wrong
-still: the water's own light is left out on cards with 32-lane waves.
+scene at 1920x1080, in one play session: about 15 frames a second at 3,000 to
+5,000 draws a frame, and about 8 at 5,000 to 12,000. The card's time is the
+limit: at 9,000 draws about 30 ms a frame go to five ray-walking programs and
+about 40 ms to ordinary drawing. The first visit to a place is slower while
+the driver builds that place's ray-tracing programs; they are saved for the
+next start. Known to be wrong still: foam on the water is drawn dark, and
+while travelling fast the ray programs' pages can lag behind.
 
 **This fork's earlier work** (up to commit `9a9091d1`) stays in this
 repository's history, with its own credits in the README of that commit.

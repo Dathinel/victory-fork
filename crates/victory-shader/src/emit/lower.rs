@@ -291,6 +291,12 @@ struct Lower<'a> {
     root_copy: Option<V>,
     /// Whether the page [`Lower::memory`] last looked for has a copy.
     page_there: Option<V>,
+    /// The looks in the directory of title memory that loads of a program
+    /// that walks have made so far ([`Lower::memory_near`]), in the order
+    /// they were lowered.
+    looks: Vec<Look>,
+    /// The IR blocks' immediate dominators, once a load asked for them.
+    idom: Option<Vec<usize>>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -362,7 +368,14 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// A program with console lanes in a group of several host waves (not `halves`): the LDS
+    /// dword of `wave_base`'s counter. A host need not give a host wave a wave-aligned run of
+    /// flat thread ids (NVIDIA fills 2-D groups from 16 x 2 tiles), so the waves take their
+    /// console threads from a counter as with `halves` (fxceless issue #1243, Vice-Tay c125c0c).
+    ticket: Option<u32>,
     wave_base: Option<V>,
+    /// With `wave_base`: this thread's place among the active lanes of its host wave.
+    wave_rank: Option<V>,
     /// The host waves of a console wave meet on their own ([`with_pair_meetings`]): the first
     /// of the LDS dwords that count each console wave's arrivals, and the dword of this
     /// thread's console wave (made in the entry block).
@@ -370,6 +383,8 @@ struct Lower<'a> {
     meeting: Option<V>,
     /// With `pairs`: the LDS accesses that need no meeting ([`LdsOrder`]).
     lds_unordered: HashSet<(usize, usize)>,
+    /// With `split_lds`: the program's own start of its LDS is stored ([`Self::lds_start`]).
+    lds_started: bool,
     /// With `pairs`: the console waves of the group, and the first of this console wave's
     /// exchange dwords ([`Self::exchange_dword`], made in the entry block).
     pair_waves: u32,
@@ -403,6 +418,30 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+}
+
+/// One look in the directory of title memory ([`Lower::memory_near`]): what
+/// a later load of the same 64 KiB page needs in place of a look of its own.
+#[derive(Clone, Copy)]
+struct Look {
+    /// The IR block whose code made it. (Its values are made at the top of
+    /// that block's code, in no branch of an instruction's own: they hold in
+    /// every block that one dominates.)
+    ir: usize,
+    /// The address registers' values the load named, before its offset.
+    base: (V, V),
+    /// The page's number (clamped: its entry in the directory).
+    page: V,
+    /// The heap slot of the copy's view and the page's first byte in it.
+    slot: V,
+    start: V,
+    /// Whether the page has a copy.
+    there: V,
+    /// The host block `slot` and `start` are made in (not in a branch of an
+    /// instruction's own), and the handle of the view at `slot` if that
+    /// block has one.
+    home: usize,
+    view: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1084,6 +1123,121 @@ pub(super) fn lds_order(p: &crate::ir::Program, st: &Structured) -> LdsOrder {
     out
 }
 
+/// The start of a console program's LDS as its own first store leaves it: (dword, value) of
+/// the plain store of constants at a constant address (`ds_write_b32`, `ds_write2_b32` of what
+/// `v_mov_b32` moved there) that stands before every other LDS access of the program. Empty
+/// without such a store.
+///
+/// The console does not clear a group's LDS: a group finds what an earlier wave left. A
+/// program that sets its LDS up in one thread (`if (thread == 0) { nearest = ~0; farthest = 0; }`
+/// behind its early-outs: the water's tiled light, `CS_TransmissionVolumetrics_Tiled`) does not
+/// set it up in a group whose thread 0 is not live (a tile whose first pixel is not water), and
+/// that group works with what was left: on the console an earlier tile's values, on a host
+/// whatever its memory held, the translation's own exchange words among it. Stored at every
+/// group's start ([`Lower::lds_start`]), the program's own values are a state the console may
+/// be in, and the one the program means: the store changes nothing where thread 0 is live.
+pub(super) fn lds_start(p: &Program) -> Vec<(u32, u32)> {
+    let lds = |i: &Inst| {
+        matches!(i.fields, Fields::Ds { gds: false, .. })
+            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        index[b] = n;
+    }
+    let with: Vec<usize> = order.iter().copied().filter(|&b| p.blocks[b].insts.iter().any(lds)).collect();
+    let Some(&first) = with.first() else {
+        return Vec::new();
+    };
+    // before every other access: its block is the first with one and dominates the others
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let after_first = |mut b: usize| loop {
+        if b == first {
+            break true;
+        }
+        if idom[b] == b || idom[b] == usize::MAX {
+            break false;
+        }
+        b = idom[b];
+    };
+    if !with.iter().all(|&b| after_first(b)) {
+        return Vec::new();
+    }
+    let Some(inst) = p.blocks[first].insts.iter().find(|i| lds(i)) else {
+        return Vec::new();
+    };
+    let Fields::Ds {
+        addr: Some(Operand::Vector { reg: addr, .. }),
+        data,
+        offset0,
+        offset1,
+        ..
+    } = &inst.fields
+    else {
+        return Vec::new();
+    };
+    // (byte offsets as [`Lower::ds`] takes them)
+    let bytes: Vec<u32> = match inst.name() {
+        "ds_write_b32" => vec![u32::from(*offset0) | u32::from(*offset1) << 8],
+        "ds_write2_b32" => vec![4 * u32::from(*offset0), 4 * u32::from(*offset1)],
+        _ => return Vec::new(),
+    };
+    // what a `v_mov_b32` of an inline constant or a literal put in the register
+    let constant = |reg: u8| -> Option<u32> {
+        let v = inst.read(Reg::V(reg))?;
+        let def = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let Fields::Valu(valu) = &def.fields else {
+            return None;
+        };
+        if def.name() != "v_mov_b32" || valu.dpp.is_some() || valu.sdwa.is_some() {
+            return None;
+        }
+        match *valu.src.first()? {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    let Some(base) = constant(*addr) else {
+        return Vec::new();
+    };
+    if bytes.len() != data.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (byte, op) in bytes.iter().zip(data) {
+        let Operand::Vector { reg, .. } = *op else {
+            return Vec::new();
+        };
+        let (Some(value), at) = (constant(reg), base.wrapping_add(*byte)) else {
+            return Vec::new();
+        };
+        if at % 4 != 0 || at / 4 >= HOST_LDS_DWORDS {
+            return Vec::new();
+        }
+        out.push((at / 4, value));
+    }
+    out
+}
+
+/// `VICTORY_LDS_START=0`: a group's LDS starts as the host's memory is, as before
+/// ([`lds_start`]).
+fn lds_start_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_START.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_START").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_start_on`], for its thread only.
+    pub(super) static TEST_LDS_START: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
@@ -1388,6 +1542,12 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Whether programs with console lanes in groups of several host waves take their console
+/// threads from a group counter (`ticket`). `VICTORY_THREAD_TICKET=0`: as before.
+fn ticket_on() -> bool {
+    std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1639,6 +1799,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
+        let mut ticket: Option<u32> = None;
         // its host waves meet per console wave (`with_pair_meetings`): the first counter's dword
         let mut pairs: Option<u32> = None;
         let mut pair_waves = 0;
@@ -1782,6 +1944,10 @@ impl<'a> Lower<'a> {
                     pair_waves = group / 64;
                     s.lds_dwords += 9 * pair_waves;
                 }
+            } else if console_lanes && group > wave && ticket_on() {
+                // the flat id rounded down is not a host wave's base on every host (#1243)
+                ticket = Some(s.lds_dwords);
+                s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1888,6 +2054,8 @@ impl<'a> Lower<'a> {
             coherent: HashSet::new(),
             root_copy: None,
             page_there: None,
+            looks: Vec::new(),
+            idom: None,
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -1954,10 +2122,13 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            ticket,
             wave_base: None,
+            wave_rank: None,
             pairs,
             meeting: None,
             lds_unordered: lds_order.unordered.clone(),
+            lds_started: false,
             pair_waves,
             pair_base: None,
             flat: None,
@@ -3368,9 +3539,18 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let page = self.memory_page(lo, hi);
+        let (slot, start, there) = self.memory_entry(page, guard, store);
+        self.page_there = Some(there);
+        self.memory_view(slot, start, lo)
+    }
+
+    /// The number of the 64 KiB page of the address `lo`, `hi`: its entry in
+    /// the directory.
+    fn memory_page(&mut self, lo: V, hi: V) -> V {
+        use super::shader::MEMORY_PAGES;
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k16, k8) = (k(self, 16), k(self, 0xFF));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
@@ -3384,6 +3564,20 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         self.s.m.tag(page, Tag::Clamp);
+        page
+    }
+
+    /// The look in the directory for `page` ([`Lower::memory_page`]): the heap
+    /// slot of the view of the copy that holds it (the null view's without a
+    /// copy, and with `store` for a page that is not to be written), the
+    /// page's first byte in that view, and whether there is a copy. Leaves
+    /// the number of a page without one for the host, for lanes that run
+    /// (`guard`). Goes on in another block.
+    fn memory_entry(&mut self, page: V, guard: Option<V>, store: bool) -> (V, V, V) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
@@ -3429,7 +3623,7 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;
-        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
+        let there = self.s.m.cmp(c, pred::NE, copy, zero);
         let copy = if store {
             let closed = self.s.m.cmp(c, pred::SLT, number, zero);
             self.s.m.select(c, closed, zero, copy)
@@ -3438,14 +3632,250 @@ impl<'a> Lower<'a> {
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        (slot, start, there)
+    }
+
+    /// The raw view at heap slot `slot` and the byte in it of the address
+    /// whose low dword is `lo`, for a page that begins at byte `start` there
+    /// ([`Lower::memory_entry`]).
+    fn memory_view(&mut self, slot: V, start: V, lo: V) -> (V, V) {
+        let c = self.cur;
         // The builder's threads read what others of the dispatch wrote (a
         // refit climbs from children to parents): globally coherent.
         let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
-        let k64k = k(self, 0xFFFF);
+        let k64k = self.s.m.i32(0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// Whether this program's loads by address share their looks in the
+    /// directory ([`Lower::memory_near`]): the programs that walk the
+    /// title's structures. Not the structure builder's (they also store, and
+    /// are not what a frame's time goes to), and not with
+    /// `VICTORY_MEMORY_NEAR=0`.
+    fn memory_shares(&self) -> bool {
+        super::memory_near() && !crate::spill::is_spilled(self.x.native)
+    }
+
+    /// [`Lower::memory`] for a read of a program that walks the title's
+    /// structures; `base` is what names the address before the
+    /// instruction's offset (its address registers' values).
+    ///
+    /// A read of the page an earlier read looked up takes that look's copy
+    /// and start: no load from the directory, no test for a missing page.
+    /// The walkers read a record with one instruction a dword or two (an
+    /// instance's matrix is eight loads from one register pair; the dwords
+    /// after a node's boxes come right behind its test), and every one was a
+    /// look of its own: a clamp, two dwords out of the 16 MB directory, the
+    /// test, a view picked from the heap by a per-lane index, then the read.
+    /// Run 410: the five walkers were 30 of the card's 85 ms a frame.
+    ///
+    /// Which earlier look ([`Lower::look_before`]): one whose code every lane
+    /// has run before this read (its block is this one or dominates it),
+    /// from this turn of the loop if the read is in one. The pages are
+    /// compared when the shader runs, so the choice only decides how often
+    /// the short way is taken, never what is read: the same page is the same
+    /// entry of the directory, which no shader writes. A page without a copy
+    /// takes the whole look, so its note is left as before, for the lanes
+    /// that run this read.
+    ///
+    /// This form gives a view's handle, for the node test's own loads; it
+    /// saves the look but picks the view anew (a handle cannot be joined).
+    /// [`Lower::memory_near_words`] reads through the earlier look's view.
+    fn memory_near(&mut self, lo: V, hi: V, base: (V, V), guard: Option<V>) -> (V, V) {
+        if !self.memory_shares() {
+            return self.memory(lo, hi, guard, false);
+        }
+        let page = self.memory_page(lo, hi);
+        let (slot, start, there) = match self.look_before(base) {
+            None => self.memory_entry(page, guard, false),
+            Some(earlier) => {
+                let look = self.looks[earlier];
+                let head = self.cur;
+                let same = self.s.m.cmp(head, pred::EQ, page, look.page);
+                let near = self.s.m.bin(head, Bin::And, same, look.there);
+                let (far, join) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::CondBr(near, join, far));
+                self.cur = far;
+                let (slot, start, there) = self.memory_entry(page, guard, false);
+                let far_end = self.cur;
+                self.s.m.terminate(far_end, Term::Br(join));
+                self.cur = join;
+                self.memory_joined(join, (head, look.slot, look.start, look.there), (far_end, slot, start, there))
+            }
+        };
+        self.page_there = Some(there);
+        let (view, byte) = self.memory_view(slot, start, lo);
+        self.looks.push(Look {
+            ir: self.cur_ir,
+            base,
+            page,
+            slot,
+            start,
+            there,
+            home: self.cur,
+            view: Some(view),
+        });
+        (view, byte)
+    }
+
+    /// The slot, the start and "there is a copy" of a look at `join`, from
+    /// the earlier look's (coming from block `near.0`) and this read's own
+    /// (from `far.0`).
+    fn memory_joined(&mut self, join: usize, near: (usize, V, V, V), far: (usize, V, V, V)) -> (V, V, V) {
+        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
+        let mut joined = |ty, a: V, b: V| {
+            let phi = self.s.m.phi(join, ty);
+            self.s.m.set_phi(phi, vec![(a, near.0), (b, far.0)]);
+            phi
+        };
+        (joined(i32t, near.1, far.1), joined(i32t, near.2, far.2), joined(i1t, near.3, far.3))
+    }
+
+    /// `n` dwords at `byte` of the raw view `h`, read by one call.
+    fn memory_words(&mut self, h: V, byte: V, n: u8) -> Vec<V> {
+        let c = self.cur;
+        let (iu, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8((1u8 << n) - 1);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        (0..n)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, u32::from(k));
+                self.as_int(x)
+            })
+            .collect()
+    }
+
+    /// The `n` dwords at the address `lo`, `hi` of title memory, for a
+    /// program that walks ([`Lower::memory_shares`]); see
+    /// [`Lower::memory_near`]. Where the page is the one of an earlier look
+    /// the dwords are read through that look's view: no look, and for a
+    /// look that has its view's handle no view picked from the heap again.
+    /// The whole look and its read stand in a branch of their own for every
+    /// other page.
+    ///
+    /// The view of an earlier look that was itself joined of two (it has no
+    /// handle: one cannot be joined): for a read from the same address
+    /// registers it is made once where that look was joined, for all the
+    /// reads of the record; for any other read, in the short branch alone.
+    fn memory_near_words(&mut self, lo: V, hi: V, base: (V, V), guard: Option<V>, n: u8) -> Vec<V> {
+        let page = self.memory_page(lo, hi);
+        let Some(earlier) = self.look_before(base) else {
+            let (slot, start, there) = self.memory_entry(page, guard, false);
+            self.page_there = Some(there);
+            let (view, byte) = self.memory_view(slot, start, lo);
+            self.looks.push(Look {
+                ir: self.cur_ir,
+                base,
+                page,
+                slot,
+                start,
+                there,
+                home: self.cur,
+                view: Some(view),
+            });
+            return self.memory_words(view, byte, n);
+        };
+        let look = self.looks[earlier];
+        let head = self.cur;
+        let same = self.s.m.cmp(head, pred::EQ, page, look.page);
+        let near = self.s.m.bin(head, Bin::And, same, look.there);
+        let (short, far, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(near, short, far));
+        // The earlier look's page: its view, the same start.
+        self.cur = short;
+        let view = match look.view {
+            Some(view) => view,
+            None if look.base == base => {
+                let view = self.memory_handle(look.home, look.slot);
+                self.looks[earlier].view = Some(view);
+                view
+            }
+            None => self.memory_handle(short, look.slot),
+        };
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(short, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(short, Bin::Add, look.start, within);
+        let near_words = self.memory_words(view, byte, n);
+        self.s.m.terminate(short, Term::Br(join));
+        // Another page: a look of its own.
+        self.cur = far;
+        let (slot, start, there) = self.memory_entry(page, guard, false);
+        let (view, byte) = self.memory_view(slot, start, lo);
+        let far_words = self.memory_words(view, byte, n);
+        let far_end = self.cur;
+        self.s.m.terminate(far_end, Term::Br(join));
+        self.cur = join;
+        let i32t = self.s.t.i32;
+        let words = near_words
+            .iter()
+            .zip(&far_words)
+            .map(|(&a, &b)| {
+                let phi = self.s.m.phi(join, i32t);
+                self.s.m.set_phi(phi, vec![(a, short), (b, far_end)]);
+                phi
+            })
+            .collect();
+        let (slot, start, there) =
+            self.memory_joined(join, (short, look.slot, look.start, look.there), (far_end, slot, start, there));
+        self.page_there = Some(there);
+        self.looks.push(Look {
+            ir: self.cur_ir,
+            base,
+            page,
+            slot,
+            start,
+            there,
+            home: join,
+            view: None,
+        });
+        words
+    }
+
+    /// The handle of the raw view of title memory at heap slot `slot`, made
+    /// in `block`.
+    fn memory_handle(&mut self, block: usize, slot: V) -> V {
+        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        self.s.heap_handle(block, slot, false, true, (11 | 0x1000 | coherent, 0))
+    }
+
+    /// The earlier look (its place in `looks`) a read from `base` in the
+    /// block being lowered may take its page from ([`Lower::memory_near`]):
+    /// the first one from the same address registers (a record's dwords: its
+    /// view serves them all), else the latest.
+    fn look_before(&mut self, base: (V, V)) -> Option<usize> {
+        if self.looks.is_empty() {
+            return None;
+        }
+        if self.idom.is_none() {
+            let p = self.x.p;
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            self.idom = Some(crate::ir::idoms(&p.blocks, &order, &self.rpo));
+        }
+        let idom = self.idom.as_ref().expect("made above");
+        // This block and those that dominate it, up to the header of the
+        // innermost loop around it: a look from before the loop is of
+        // another node.
+        let mut above = vec![self.cur_ir];
+        let mut d = self.cur_ir;
+        while !self.counters.contains_key(&d) && idom[d] != d && idom[d] != usize::MAX {
+            d = idom[d];
+            above.push(d);
+        }
+        let known = |l: &Look| above.contains(&l.ir);
+        self.looks
+            .iter()
+            .position(|l| known(l) && l.base == base)
+            .or_else(|| self.looks.iter().rposition(known))
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -3529,8 +3959,8 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
             l.i32_of(v)
         };
-        let (lo, hi) = (word(self, 0)?, word(self, 1)?);
-        let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
+        let base = (word(self, 0)?, word(self, 1)?);
+        let (lo, hi) = self.address_plus(base.0, base.1, i32::from(*offset));
         let guard = self.guard(b, i)?;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
@@ -3548,6 +3978,13 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
+            if self.memory_shares() {
+                let words = self.memory_near_words(lo, hi, base, guard, n);
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
             let (h, byte) = self.memory(lo, hi, guard, false);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
@@ -4348,11 +4785,13 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let w = self.s.wave_size.unwrap_or(32);
+        let group: u32 = self.s.threads.map_or(w, |t| t.iter().product());
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -4373,15 +4812,29 @@ impl<'a> Lower<'a> {
             self.s.m.store(e, ptr, zero);
         }
         self.group_sync(e);
-        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        let one = self.s.m.i32(1);
+        let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+        let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
+        let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
+        let kw = self.s.m.i32(w);
+        let full = self.s.m.cmp(e, pred::EQ, count, kw);
+        let first = self.s.m.cmp(e, pred::EQ, rank, zero);
+        let sixteen = self.s.m.i32(16);
+        let high = self.s.m.bin(e, Bin::Shl, count, sixteen);
+        let take = self.s.m.select(e, full, kw, high);
+        let add = self.s.m.select(e, first, take, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let low_mask = self.s.m.i32(0xffff);
+        let low = self.s.m.bin(e, Bin::And, found, low_mask);
+        let past = self.s.m.bin(e, Bin::LShr, found, sixteen);
+        let blocks = self.s.m.i32(group / w * w);
+        let tail = self.s.m.bin(e, Bin::Add, blocks, past);
+        let base = self.s.m.select(e, full, low, tail);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
+        self.wave_rank = Some(rank);
         Some(base)
     }
 
@@ -4389,10 +4842,11 @@ impl<'a> Lower<'a> {
     /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         if let Some(base) = self.wave_base() {
-            return self.s.m.bin(e, Bin::Add, base, lane);
+            let rank = self.wave_rank.expect("made with the base");
+            return self.s.m.bin(e, Bin::Add, base, rank);
         }
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
         let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
         let wave = self.s.wave_size.unwrap_or(32);
@@ -5012,7 +5466,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.ticket.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -5351,6 +5805,34 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A console wave run as two host waves, one console wave a group: every thread stores
+    /// the program's own start of its LDS ([`lds_start`]) in the entry block. The group
+    /// barrier that stands before each LDS access (`split_lds`) comes after it for every
+    /// thread, so no thread's store lands on what the program wrote since. Two stores a
+    /// thread, no barrier of its own.
+    fn lds_start(&mut self) {
+        if !self.split_lds || std::mem::replace(&mut self.lds_started, true) || !lds_start_on() {
+            return;
+        }
+        let StageIo::Cs(cs) = &self.x.native.io else {
+            return;
+        };
+        if cs.threads.iter().product::<u32>() != 64 {
+            return;
+        }
+        let own = cs.lds_bytes() / 4;
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in lds_start(self.x.p) {
+            if dword >= own {
+                continue;
+            }
+            let (k, x) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, k);
+            self.s.m.store(e, ptr, x);
+        }
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -5463,6 +5945,7 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        self.lds_start();
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).

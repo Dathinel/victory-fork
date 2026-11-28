@@ -124,9 +124,53 @@ impl Target {
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 }
 
+/// Read-back buffers free after their landings, by power-of-two size.
+static RESERVE: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+/// The most buffers and bytes kept for reuse.
+const RESERVE_MOST: (usize, u64) = (64, 64 << 20);
+
+/// A read-back buffer returned to [`RESERVE`] when its landing is done.
+struct Reserved {
+    size: u64,
+    buffer: Option<ID3D12Resource>,
+}
+
+impl Reserved {
+    fn new(host: &crate::host::Host, size: u64) -> Option<Self> {
+        // One power-of-two size serves the few texture shapes copied back.
+        let size = size.max(1);
+        let size = size.checked_next_power_of_two().unwrap_or(size);
+        let buffer = {
+            let mut reserve = RESERVE.lock().unwrap_or_else(|e| e.into_inner());
+            let at = reserve.iter().position(|(held, _)| *held == size);
+            at.map(|i| reserve.swap_remove(i).1)
+        };
+        let buffer = buffer.or_else(|| host.read_back_buffer(size))?;
+        Some(Self { size, buffer: Some(buffer) })
+    }
+
+    fn resource(&self) -> &ID3D12Resource {
+        self.buffer.as_ref().expect("a reserved buffer lives until its landing is done")
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut reserve = RESERVE.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = reserve.iter().fold(0u64, |all, (size, _)| all.saturating_add(*size));
+        // Reuse is bounded; what does not fit is released as before.
+        if reserve.len() < RESERVE_MOST.0 && bytes.saturating_add(self.size) <= RESERVE_MOST.1 {
+            reserve.push((self.size, buffer));
+        }
+    }
+}
+
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Reserved,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -177,11 +221,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = Reserved::new(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer.resource()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -198,7 +242,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
-pub(crate) fn land(back: &Back) {
+/// Taking `back` returns its buffer once read: the card is done with it then.
+pub(crate) fn land(back: Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
@@ -220,7 +265,7 @@ pub(crate) fn land(back: &Back) {
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if back.buffer.resource().Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -235,12 +280,12 @@ pub(crate) fn land(back: &Back) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { back.buffer.resource().Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { back.buffer.resource().Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {

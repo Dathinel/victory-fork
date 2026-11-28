@@ -2868,34 +2868,44 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let (start, step) = (views.start, views.step);
+            let entries = views.made.len();
+            debug_assert!(!windows::core::Interface::as_raw(&views.heap).is_null());
+            // One entry lookup: every indirect draw otherwise hashes the same record twice.
+            let made = match views.made.entry(words) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let view = super::view_at(words[1], words[2])?;
+                    let at = 2 * entries as u32;
+                    // (A constant buffer's bytes are copied for each draw.)
+                    if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                        return None;
+                    }
+                    let twin = twinned(&view);
+                    let kept = make_twinned(
+                        &view,
+                        ListViews::slot_at(start, step, at),
+                        Some(ListViews::slot_at(start, step, at + 1)),
+                    )?;
+                    let stride_word = view_stride_word(&view);
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: is_texture_view(&view),
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    entry.insert(ListView { view, at, twin, stride_word, kept, listed })
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
-            }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            };
+            self.copy_from(index, ListViews::slot_at(start, step, made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.copy_from(self.raw + index, ListViews::slot_at(start, step, made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -2965,6 +2975,27 @@ impl HostHeap {
                 return;
             }
             std::mem::replace(&mut *slot, resource)
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::keep`] for a borrowed resource, cloned only when it differs.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // The same raw resource again: no AddRef only to let it go.
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -6147,9 +6178,9 @@ impl ListViews {
         }
     }
 
-    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    fn slot_at(start: usize, step: usize, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS);
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step }
     }
 }
 

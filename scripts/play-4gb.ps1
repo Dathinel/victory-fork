@@ -39,6 +39,8 @@ param(
     # target\diag\victory.exe. The release build has no diagnostics counters in it and is the
     # faster of the two here.
     [string]$Victory,
+    # More switches, or other values for the ones set here: 'VICTORY_X=1', 'VICTORY_Y=' (empty: not set); several in one string with ";" between.
+    [string[]]$More,
     # Prints the switches and starts nothing.
     [switch]$Show
 )
@@ -91,6 +93,13 @@ $skip = 'rt_off_hashes.txt', 'rt_work_off_hashes.txt' | ForEach-Object { Join-Pa
     Where-Object { Test-Path $_ } | ForEach-Object { (Get-Content $_ -Raw) -replace '\s', '' }
 # VICTORY_LEAVE_OUT, not VICTORY_SKIP_PIPELINES: the latter exists in diagnostics builds only.
 if ($skip) { $set.VICTORY_LEAVE_OUT = $skip -join ',' }
+# -More wins over everything above; an empty value takes the switch out.
+foreach ($pair in ($More | ForEach-Object { "$_" -split ";" } | Where-Object { $_.Trim() })) {
+    $name, $value = "$pair".Split('=', 2)
+    $name = $name.Trim()
+    if ($name -notmatch '^VICTORY_[A-Z0-9_]+$') { throw "-More expects VICTORY_NAME=value, not '$pair'" }
+    if ($value) { $set[$name] = $value.Trim() } else { $set.Remove($name) }
+}
 
 "quality ${Quality}: textures at $($p.Texture), render scale $($p.Render)" + $(if ($p.Budget) { ", $($p.Budget) MB of textures" })
 if ($Show) {

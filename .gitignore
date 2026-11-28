@@ -79,3 +79,6 @@ validate_*.txt
 *.swp
 Thumbs.db
 .DS_Store
+
+# the window launcher's remembered choices (local paths)
+/scripts/launcher-4gb.json

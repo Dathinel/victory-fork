@@ -3957,8 +3957,12 @@ pub(crate) fn walls_trace() -> bool {
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
-    // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
+    // ([`crate::texback`]). The list has run, so each landing is its buffer's last use.
+    let texture_backs = {
+        let mut deferred = list.deferred();
+        std::mem::take(&mut deferred.texture_backs)
+    };
+    for back in texture_backs {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {

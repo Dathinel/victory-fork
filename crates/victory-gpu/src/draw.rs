@@ -5014,8 +5014,22 @@ mod thread_tests {
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
+    thread_local! {
+        // Signatures are never removed, so a thread's hit needs no global lock.
+        static CACHED: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(signature) = CACHED.with(|cached| {
+        cached.borrow().iter().find(|(k, _)| *k == (kind, stride)).map(|(_, s)| s.clone())
+    }) {
+        return Some(signature);
+    }
+    let cache = |signature: &ID3D12CommandSignature| {
+        CACHED.with(|cached| cached.borrow_mut().push(((kind, stride), signature.clone())));
+    };
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        cache(s);
         return Some(s.clone());
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
@@ -5043,6 +5057,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    cache(&signature);
     Some(signature)
 }
 

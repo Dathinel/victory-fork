@@ -1298,6 +1298,9 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             // The F1 settings menu takes the keyboard while it is shown.
             if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                // As with focus away: a key tapped while the menu had the keyboard is not
+                // the title's, so the first look after it closes only clears the low bits.
+                self.focused = false;
                 return Vec::new();
             }
             let mut down = scripted();
